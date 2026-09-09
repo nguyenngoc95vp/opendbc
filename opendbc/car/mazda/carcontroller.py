@@ -14,8 +14,6 @@ from opendbc.sunnypilot.car.mazda.icbm import IntelligentCruiseButtonManagementI
 VisualAlert = structs.CarControl.HUDControl.VisualAlert
 LongCtrlState = structs.CarControl.Actuators.LongControlState
 
-# Synthetic radar frames go to the car and to the camera; the panda only forwards
-# received frames between those buses, not our own transmissions.
 LONG_BUSES = (0, 2)
 
 
@@ -64,33 +62,37 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
                                                       CS.out.steeringTorque, self.params, steer_max)
 
     if self.CP.flags & MazdaFlags.TORQUE_INTERCEPTOR:
-      if CC.latActive and CS.ti_lkas_allowed:
+      # Keep the TI frame alive while taking over. The lateral controller may already have
+      # paused (CC.latActive=False), but a healthy TI RUN state still gets a controlled
+      # minimum command instead of an immediate zero.
+      if CS.ti_lkas_allowed:
         if hasattr(self.ti_params, 'STEER_MAX_LOOKUP'):
           ti_steer_max = round(float(np.interp(CS.out.vEgoRaw, self.ti_params.STEER_MAX_LOOKUP[0],
                                                self.ti_params.STEER_MAX_LOOKUP[1])))
         else:
           ti_steer_max = self.ti_params.STEER_MAX
 
-        ti_new_torque = int(round(CC.actuators.torque * ti_steer_max))
-        if CS.out.vEgoRaw < self.ti_params.STANDSTILL_ZERO_SPEED:
-          ti_new_torque = 0
-        ti_apply_torque = apply_driver_steer_torque_limits(ti_new_torque, self.ti_apply_torque_last,
-                                                           CS.out.steeringTorque, self.ti_params, ti_steer_max)
-
-        # Driver takeover: once steeringPressed is true, progressively bring TI down to
-        # the experimental floor instead of dropping the command abruptly. The floor is
-        # intentionally small (15 counts) and only applies while TI still reports RUN;
-        # DRIVER_OVER is still honored by the normal TI health gate below.
-        ti_min_torque = 15
-        if CS.out.steeringPressed:
-          if self.ti_apply_torque_last > ti_min_torque:
-            ti_apply_torque = max(self.ti_apply_torque_last - self.ti_params.STEER_DELTA_DOWN,
-                                  ti_min_torque)
-          elif self.ti_apply_torque_last < -ti_min_torque:
-            ti_apply_torque = min(self.ti_apply_torque_last + self.ti_params.STEER_DELTA_DOWN,
-                                  -ti_min_torque)
+        if CC.latActive and not CS.out.steeringPressed:
+          ti_new_torque = int(round(CC.actuators.torque * ti_steer_max))
+          if CS.out.vEgoRaw < self.ti_params.STANDSTILL_ZERO_SPEED:
+            ti_new_torque = 0
+          ti_apply_torque = apply_driver_steer_torque_limits(ti_new_torque, self.ti_apply_torque_last,
+                                                             CS.out.steeringTorque, self.ti_params, ti_steer_max)
+        elif CS.out.steeringPressed:
+          ti_min_torque = 15
+          prev = self.ti_apply_torque_last
+          if prev > ti_min_torque:
+            ti_apply_torque = max(prev - self.ti_params.STEER_DELTA_DOWN, ti_min_torque)
+          elif prev < -ti_min_torque:
+            ti_apply_torque = min(prev + self.ti_params.STEER_DELTA_DOWN, -ti_min_torque)
           else:
-            ti_apply_torque = int(np.clip(ti_apply_torque, -ti_min_torque, ti_min_torque))
+            ti_apply_torque = int(np.clip(prev, -ti_min_torque, ti_min_torque))
+        else:
+          prev = self.ti_apply_torque_last
+          if prev > 0:
+            ti_apply_torque = max(prev - self.ti_params.STEER_DELTA_DOWN, 0)
+          elif prev < 0:
+            ti_apply_torque = min(prev + self.ti_params.STEER_DELTA_DOWN, 0)
 
         if self.ti_rt_torque_last_ts is None:
           self.ti_rt_torque_last_ts = now_nanos
@@ -101,7 +103,6 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
           self.ti_rt_torque_last = ti_apply_torque
           self.ti_rt_torque_last_ts = now_nanos
       else:
-        # Soft release: slew to zero at down-rate instead of a hard cut.
         prev = self.ti_apply_torque_last
         if prev > 0:
           ti_apply_torque = max(prev - self.ti_params.STEER_DELTA_DOWN, 0)
