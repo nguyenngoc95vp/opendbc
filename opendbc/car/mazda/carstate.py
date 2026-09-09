@@ -95,7 +95,7 @@ class CarState(CarStateBase, CarStateExt):
       cp_body = can_parsers[Bus.body]
       ti_feedback = cp_body.vl["TI_FEEDBACK"]
       ret.steeringTorque = ti_feedback["TI_TORQUE_SENSOR"]
-      ret.steeringPressed = self.update_steering_pressed(abs(ret.steeringTorque) > 6, 5)
+      ret.steeringPressed = self.update_steering_pressed(abs(ret.steeringTorque) > 3, 5)
       # known TI firmware reports VERSION_NUMBER 1 or 16 (0x10); both are healthy
       self.ti_lkas_allowed = cp_body.can_valid and \
         ti_feedback["VERSION_NUMBER"] in (1, 16) and \
@@ -327,9 +327,7 @@ class CarState(CarStateBase, CarStateExt):
   def get_can_parsers(CP, CP_SP):
     pt_messages = []
     if CP.openpilotLongitudinalControl:
-      # no liveness checks: the stock frame is expected to disappear after the radar
-      # teardown (its presence is what the two-master guard watches for), and the UDS
-      # response only arrives when a session request is answered
+      # no liveness checks: the stock frame is expected to disappear after the radar teardown (its presence is what the two-master guard watches for), and the UDS response only arrives when a session request is answered
       pt_messages.append(("CRZ_INFO", float("nan")))
       pt_messages.append(("RADAR_UDS_RESPONSE", float("nan")))
     cam_messages = [
