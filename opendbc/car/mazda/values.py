@@ -17,6 +17,7 @@ Ecu = CarParams.Ecu
 class CarControllerParams:
   STEER_DRIVER_ALLOWANCE = 15     # allowed driver torque before start limiting
   STEER_DRIVER_FACTOR = 1         # from dbc
+  STEER_ERROR_MAX = 350
   # 100 Hz. The stock camera commands CAM_LKAS at 16.6 Hz (60 ms); we send 6x that. The EPS
   # rate limit is per unit TIME (~1200 units/s), not per received frame -- measured on a stock
   # drive where the camera commands at 16.6 Hz and the EPS still steps 12 units per 10 ms
@@ -161,7 +162,7 @@ class CarControllerParams:
     # CX-9 that shares this EPS and CX-5-EPS swaps keep it. TI also lowers minSteerSpeed, so
     # the explicit EPS capability flag is the only safe identity for this tune.
     if CP.flags & MazdaFlags.STEER_TO_ZERO:
-      self.STEER_MAX = 1200        # theoretical max_steer 2047; EPS clips above ceiling per speed
+      self.STEER_MAX = 800         # Starcx8 GEN1 tune
       # 1200 below 32 mph for full low-speed authority and feedforward overshoot.
       # 800 above for smoother highway steering.
       self.STEER_MAX_LOOKUP = ([0., 14.2, 14.5], [1200, 1200, 800])
@@ -175,9 +176,9 @@ class CarControllerParams:
       # is (p99 of that gap was 700-800 units below 20 mph, max 1400), so the command can cross
       # zero while the wheel is still turned and the P term keeps building against a measurement
       # that has not responded yet. Panda keeps max_rate_down = 25 as the looser backstop.
-      self.STEER_DELTA_UP = 12
-      self.STEER_DELTA_DOWN = 12
-      self.STEER_DRIVER_MULTIPLIER = 15   # weight driver torque (tuned for the CX-5 EPS; upstream stock is 1)
+      self.STEER_DELTA_UP = 10
+      self.STEER_DELTA_DOWN = 25
+      self.STEER_DRIVER_MULTIPLIER = 40   # Starcx8 tune
       # Torque the EPS will actually apply, by speed. Measured over 11,408,748 clean frames
       # (4798 segments, not LKAS_BLOCK / not steeringPressed / vEgo > 2) from 0x241
       # STEER_RATE, which the EPS itself transmits: LKAS_EFFECTIVE is what it applied.
@@ -198,7 +199,7 @@ class CarControllerParams:
       self.STEER_MAX = 800         # theoretical max_steer 2047
       self.STEER_DELTA_UP = 10
       self.STEER_DELTA_DOWN = 25
-      self.STEER_DRIVER_MULTIPLIER = 1    # upstream stock
+      self.STEER_DRIVER_MULTIPLIER = 40   # Starcx8 tune
 
 
 class TorqueInterceptorControllerParams:
@@ -208,6 +209,7 @@ class TorqueInterceptorControllerParams:
   STEER_DRIVER_ALLOWANCE = 15
   STEER_DRIVER_MULTIPLIER = 40
   STEER_DRIVER_FACTOR = 1
+  STEER_ERROR_MAX = 350
   STEER_MAX_RT_DELTA = 192
   STEER_RT_INTERVAL_NS = 250_000_000
   # below this speed the TI gets zero torque: kills standstill wheel wiggle and the
@@ -221,8 +223,6 @@ class TorqueInterceptorControllerParams:
     # CX-8 (K19G, same generation): route 8762fabfa41efd82_00000006--712dfc7c83 showed the base
     # 6/frame limiter saturating on 9.5-22.6% of command frames. Validate on-device: watch for
     # EPS steer faults on hard transitions.
-    if CP.flags & MazdaFlags.STEER_TO_ZERO or CP.carFingerprint == "MAZDA_CX8_2022":
-      self.STEER_DELTA_UP = 12
     if CP.flags & MazdaFlags.STEER_TO_ZERO:
       # The magnitude envelope does NOT port: the TI's DAC output stage self-protects above
       # ~600 (STATE=OFF + VIOL=0x11, latched ~30 s). First-drive evidence 2026-08-22: 9 cutouts,
