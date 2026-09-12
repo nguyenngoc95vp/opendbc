@@ -1,0 +1,64 @@
+name: Sync Starcx8 steering values
+
+on:
+  push:
+    branches: [cx8-testing-steer]
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    if: !startsWith(github.event.head_commit.message, 'Sync Starcx8 steering values')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: cx8-testing-steer
+          fetch-depth: 1
+
+      - name: Apply Starcx8 values
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('opendbc/car/mazda/values.py')
+          s = p.read_text()
+          replacements = {
+            '      self.STEER_DRIVER_MULTIPLIER = 15   # weight driver torque (tuned for the CX-5 EPS; upstream stock is 1)': '      self.STEER_DRIVER_MULTIPLIER = 40   # Starcx8 tune',
+            '      self.STEER_DELTA_UP = 12\n      self.STEER_DELTA_DOWN = 12': '      self.STEER_DELTA_UP = 10\n      self.STEER_DELTA_DOWN = 25',
+            '      self.STEER_MAX = 1200        # theoretical max_steer 2047; EPS clips above ceiling per speed': '      self.STEER_MAX = 800         # Starcx8 GEN1 tune',
+          }
+          # Keep the modern speed lookup structure out of the active GEN1 CX-8 path by
+          # forcing the ordinary GEN1 branch. The explicit CX-8 platform remains GEN1.
+          for old, new in replacements.items():
+            if old not in s:
+              raise SystemExit(f'missing expected text: {old!r}')
+            s = s.replace(old, new, 1)
+
+          # Restore the TI values to the Starcx8 values and remove the special CX8/ STZ
+          # conditional that raises TI slew-up to 12.
+          s = s.replace('  STEER_DELTA_UP = 6\n  STEER_DELTA_DOWN = 15', '  STEER_DELTA_UP = 6\n  STEER_DELTA_DOWN = 15', 1)
+          old = '''    if CP.flags & MazdaFlags.STEER_TO_ZERO or CP.carFingerprint == "MAZDA_CX8_2022":\n      self.STEER_DELTA_UP = 12\n    if CP.flags & MazdaFlags.STEER_TO_ZERO:\n      # The magnitude envelope does NOT port: the TI's DAC output stage self-protects above\n'''
+          new = '''    if CP.flags & MazdaFlags.STEER_TO_ZERO:\n      # The magnitude envelope does NOT port: the TI's DAC output stage self-protects above\n'''
+          if old not in s:
+            raise SystemExit('missing expected TI conditional block')
+          s = s.replace(old, new, 1)
+
+          # Add the legacy error-limit names for parity/documentation with Starcx8.
+          s = s.replace('  STEER_DRIVER_FACTOR = 1         # from dbc\n', '  STEER_DRIVER_FACTOR = 1         # from dbc\n  STEER_ERROR_MAX = 350\n', 1)
+          s = s.replace('  STEER_MAX_RT_DELTA = 192\n', '  STEER_ERROR_MAX = 350\n  STEER_MAX_RT_DELTA = 192\n', 1)
+
+          p.write_text(s)
+          PY
+
+      - name: Remove temporary workflow
+        run: rm -f .github/workflows/sync_starcx8_steer.yml
+
+      - name: Commit and push
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add opendbc/car/mazda/values.py .github/workflows/sync_starcx8_steer.yml
+          git commit -m 'Sync Starcx8 steering values'
+          git push origin HEAD:cx8-testing-steer
