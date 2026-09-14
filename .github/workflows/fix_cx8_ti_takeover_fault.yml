@@ -1,0 +1,80 @@
+name: Fix CX-8 TI takeover fault separation
+
+on:
+  push:
+    branches: [cx8-ti-handoff-kp06]
+
+jobs:
+  patch:
+    if: github.actor == 'nguyenngoc95vp'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: cx8-ti-handoff-kp06
+          fetch-depth: 1
+
+      - name: Patch TI takeover/fault handling
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          cs = Path('opendbc/car/mazda/carstate.py')
+          s = cs.read_text()
+
+          s = s.replace(
+              'CAM_LANEINFO_FRESH_FRAMES = int(CarControllerParams.CAM_LANEINFO_FRESH_T / DT_CTRL)\n',
+              'CAM_LANEINFO_FRESH_FRAMES = int(CarControllerParams.CAM_LANEINFO_FRESH_T / DT_CTRL)\nTI_FAULT_CONFIRM_FRAMES = int(0.4 / DT_CTRL)\n'
+          )
+          s = s.replace(
+              '    self.ti_lkas_allowed = False\n',
+              '    self.ti_lkas_allowed = False\n    self.ti_driver_over = False\n    self.ti_fault_frames = 0\n',
+              1,
+          )
+          old = '''      # known TI firmware reports VERSION_NUMBER 1 or 16 (0x10); both are healthy\n      self.ti_lkas_allowed = cp_body.can_valid and \\\n        ti_feedback["VERSION_NUMBER"] in (1, 16) and \\\n        ti_feedback["STATE"] == TorqueInterceptorState.RUN and \\\n        not any(ti_feedback[s] for s in ("VIOL", "ERROR", "RAMP_DOWN"))\n      ret_sp.torqueInterceptorReady = self.ti_lkas_allowed\n'''
+          new = '''      # DRIVER_OVER is an expected driver-takeover state, not a TI hardware fault.\n      # Keep it separate from the real-fault path so touching the wheel does not trigger\n      # steerTempUnavailable / the loud stock warning.\n      ti_state = ti_feedback["STATE"]\n      self.ti_driver_over = ti_state == TorqueInterceptorState.DRIVER_OVER\n      ti_base_valid = cp_body.can_valid and ti_feedback["VERSION_NUMBER"] in (1, 16)\n      ti_fault = (not ti_base_valid) or \\\n        ti_state not in (TorqueInterceptorState.RUN, TorqueInterceptorState.DRIVER_OVER) or \\\n        any(ti_feedback[s] for s in ("VIOL", "ERROR", "RAMP_DOWN"))\n      if ti_fault:\n        self.ti_fault_frames += 1\n      else:\n        self.ti_fault_frames = 0\n      # RUN and DRIVER_OVER are both usable/expected TI states. DRIVER_OVER is exposed\n      # separately so the controller can keep TI alive while yielding torque to the driver.\n      self.ti_lkas_allowed = ti_base_valid and \\\n        ti_state in (TorqueInterceptorState.RUN, TorqueInterceptorState.DRIVER_OVER) and \\\n        not any(ti_feedback[s] for s in ("VIOL", "ERROR", "RAMP_DOWN"))\n      ret_sp.torqueInterceptorReady = self.ti_lkas_allowed and not self.ti_driver_over\n'''
+          if old not in s:
+              raise SystemExit('carstate TI block anchor not found')
+          s = s.replace(old, new, 1)
+
+          old_fault = '      ret.steerFaultTemporary = not self.ti_lkas_allowed and ret.vEgo > 10\n'
+          new_fault = '''      # A brief TI transition (especially DRIVER_OVER) is not a hardware fault.\n      # Only surface a steering fault after a genuine TI fault has persisted for 400 ms.\n      ret.steerFaultTemporary = self.ti_fault_frames >= TI_FAULT_CONFIRM_FRAMES and ret.vEgo > 10\n'''
+          if old_fault not in s:
+              raise SystemExit('carstate steerFaultTemporary anchor not found')
+          s = s.replace(old_fault, new_fault, 1)
+          cs.write_text(s)
+
+          cc = Path('opendbc/car/mazda/carcontroller.py')
+          s = cc.read_text()
+          old = '    ti_takeover_capable = bool(self.CP.flags & MazdaFlags.TORQUE_INTERCEPTOR) and CS.ti_lkas_allowed\n'
+          new = '''    # Driver takeover is independent from the TI RUN/DRIVER_OVER distinction.\n    # DRIVER_OVER is the expected state while the driver has authority.\n    ti_takeover_capable = bool(self.CP.flags & MazdaFlags.TORQUE_INTERCEPTOR) and \\\n      (CS.ti_lkas_allowed or CS.ti_driver_over)\n'''
+          if old not in s:
+              raise SystemExit('carcontroller takeover anchor not found')
+          s = s.replace(old, new, 1)
+
+          old = '      if CC.latActive and CS.ti_lkas_allowed:\n'
+          new = '      if CC.latActive and CS.ti_lkas_allowed and not CS.ti_driver_over:\n'
+          if old not in s:
+              raise SystemExit('carcontroller TI torque anchor not found')
+          s = s.replace(old, new, 1)
+          cc.write_text(s)
+
+          print('PATCH_OK')
+          PY
+
+      - name: Verify
+        run: |
+          grep -n "TI_FAULT_CONFIRM_FRAMES\|ti_driver_over\|ti_fault_frames\|DRIVER_OVER\|steerFaultTemporary" opendbc/car/mazda/carstate.py
+          grep -n "ti_takeover_capable\|not CS.ti_driver_over" opendbc/car/mazda/carcontroller.py
+
+      - name: Commit patch and remove workflow
+        run: |
+          git config user.name "nguyenngoc95vp"
+          git config user.email "nguyenngoc95vp@users.noreply.github.com"
+          git add opendbc/car/mazda/carstate.py opendbc/car/mazda/carcontroller.py .github/workflows/fix_cx8_ti_takeover_fault.yml
+          git commit -m "Separate CX-8 TI driver takeover from faults"
+          git rm .github/workflows/fix_cx8_ti_takeover_fault.yml
+          git commit -m "Remove temporary TI patch workflow"
+          git push origin HEAD:cx8-ti-handoff-kp06
