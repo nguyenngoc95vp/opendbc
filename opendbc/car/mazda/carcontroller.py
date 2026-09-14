@@ -61,7 +61,10 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
 
     # Driver takeover state machine. This does NOT disable TI: TI readiness/state is
     # left untouched and create_ti_steering_control() continues to send every frame.
-    ti_takeover_capable = bool(self.CP.flags & MazdaFlags.TORQUE_INTERCEPTOR) and CS.ti_lkas_allowed
+    # Driver takeover is independent from the TI RUN/DRIVER_OVER distinction.
+    # DRIVER_OVER is the expected state while the driver has authority.
+    ti_takeover_capable = bool(self.CP.flags & MazdaFlags.TORQUE_INTERCEPTOR) and \
+      (CS.ti_lkas_allowed or CS.ti_driver_over)
     driver_touch = bool(CC.latActive and ti_takeover_capable and CS.out.steeringPressed)
 
     if not CC.latActive or not ti_takeover_capable:
@@ -118,7 +121,7 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
                                                       CS.out.steeringTorque, self.params, steer_max)
 
     if self.CP.flags & MazdaFlags.TORQUE_INTERCEPTOR:
-      if CC.latActive and CS.ti_lkas_allowed:
+      if CC.latActive and CS.ti_lkas_allowed and not CS.ti_driver_over:
         if hasattr(self.ti_params, 'STEER_MAX_LOOKUP'):
           ti_steer_max = round(float(np.interp(CS.out.vEgoRaw, self.ti_params.STEER_MAX_LOOKUP[0],
                                                self.ti_params.STEER_MAX_LOOKUP[1])))

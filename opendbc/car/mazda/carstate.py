@@ -12,6 +12,7 @@ STOCK_RADAR_ALIVE_FRAMES = int(CarControllerParams.STOCK_RADAR_ALIVE_T / DT_CTRL
 STOCK_RADAR_GUARD_FRAMES = int(CarControllerParams.STOCK_RADAR_GUARD_T / DT_CTRL)
 CANCEL_CONTEXT_FRAMES = int(CarControllerParams.CANCEL_CONTEXT_T / DT_CTRL)
 CAM_LANEINFO_FRESH_FRAMES = int(CarControllerParams.CAM_LANEINFO_FRESH_T / DT_CTRL)
+TI_FAULT_CONFIRM_FRAMES = int(0.4 / DT_CTRL)
 
 
 class CarState(CarStateBase, CarStateExt):
@@ -26,6 +27,8 @@ class CarState(CarStateBase, CarStateExt):
     self.acc_active_last = False
     self.lkas_allowed_speed = False
     self.ti_lkas_allowed = False
+    self.ti_driver_over = False
+    self.ti_fault_frames = 0
 
     self.distance_button = 0
     self.accel_button = 0
@@ -96,12 +99,25 @@ class CarState(CarStateBase, CarStateExt):
       ti_feedback = cp_body.vl["TI_FEEDBACK"]
       ret.steeringTorque = ti_feedback["TI_TORQUE_SENSOR"]
       ret.steeringPressed = self.update_steering_pressed(abs(ret.steeringTorque) > 6, 5)
-      # known TI firmware reports VERSION_NUMBER 1 or 16 (0x10); both are healthy
-      self.ti_lkas_allowed = cp_body.can_valid and \
-        ti_feedback["VERSION_NUMBER"] in (1, 16) and \
-        ti_feedback["STATE"] == TorqueInterceptorState.RUN and \
+      # DRIVER_OVER is an expected driver-takeover state, not a TI hardware fault.
+      # Keep it separate from the real-fault path so touching the wheel does not trigger
+      # steerTempUnavailable / the loud stock warning.
+      ti_state = ti_feedback["STATE"]
+      self.ti_driver_over = ti_state == TorqueInterceptorState.DRIVER_OVER
+      ti_base_valid = cp_body.can_valid and ti_feedback["VERSION_NUMBER"] in (1, 16)
+      ti_fault = (not ti_base_valid) or \
+        ti_state not in (TorqueInterceptorState.RUN, TorqueInterceptorState.DRIVER_OVER) or \
+        any(ti_feedback[s] for s in ("VIOL", "ERROR", "RAMP_DOWN"))
+      if ti_fault:
+        self.ti_fault_frames += 1
+      else:
+        self.ti_fault_frames = 0
+      # RUN and DRIVER_OVER are both usable/expected TI states. DRIVER_OVER is exposed
+      # separately so the controller can keep TI alive while yielding torque to the driver.
+      self.ti_lkas_allowed = ti_base_valid and \
+        ti_state in (TorqueInterceptorState.RUN, TorqueInterceptorState.DRIVER_OVER) and \
         not any(ti_feedback[s] for s in ("VIOL", "ERROR", "RAMP_DOWN"))
-      ret_sp.torqueInterceptorReady = self.ti_lkas_allowed
+      ret_sp.torqueInterceptorReady = self.ti_lkas_allowed and not self.ti_driver_over
     else:
       ret.steeringTorque = cp.vl["STEER_TORQUE"]["STEER_TORQUE_SENSOR"]
       ret.steeringPressed = self.update_steering_pressed(abs(ret.steeringTorque) > LKAS_LIMITS.STEER_THRESHOLD, 5)
@@ -273,7 +289,9 @@ class CarState(CarStateBase, CarStateExt):
       # TI drops out of RUN at low speed/standstill by design (steering-current
       # self-protection) and recovers on roll-out — only fault at real speed,
       # where not-ready is genuine and the soft-disable takeover is warranted.
-      ret.steerFaultTemporary = not self.ti_lkas_allowed and ret.vEgo > 10
+      # A brief TI transition (especially DRIVER_OVER) is not a hardware fault.
+      # Only surface a steering fault after a genuine TI fault has persisted for 400 ms.
+      ret.steerFaultTemporary = self.ti_fault_frames >= TI_FAULT_CONFIRM_FRAMES and ret.vEgo > 10
     elif self.CP.minSteerSpeed > 0:
       ret.steerFaultTemporary = self.lkas_allowed_speed and lkas_blocked
     else:
