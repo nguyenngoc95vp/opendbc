@@ -1,0 +1,114 @@
+name: Patch CX8 TI handoff to 0.5s no ramp
+
+on:
+  push:
+    branches: [cx8-ti-handoff-0.5s]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: cx8-ti-handoff-0.5s
+          fetch-depth: 1
+          submodules: false
+
+      - name: Patch takeover behavior
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('opendbc/car/mazda/carcontroller.py')
+          s = p.read_text()
+
+          old = '''# Driver takeover: yield immediately on steering-wheel input, keep TI alive and
+# transmitting zero torque, then wait 100 ms after release before a 500 ms ramp back.
+TI_HANDOFF_RELEASE_DELAY_FRAMES = int(0.10 / DT_CTRL)
+TI_HANDOFF_RAMP_FRAMES = int(0.50 / DT_CTRL)'''
+          new = '''# Driver takeover: yield immediately on steering-wheel input, keep TI alive and
+# transmitting zero torque, then hold zero torque for 500 ms after release before
+# immediately restoring the requested OP + TI torque. No ramp is used.
+TI_HANDOFF_RELEASE_DELAY_FRAMES = int(0.50 / DT_CTRL)'''
+          if old not in s:
+            raise SystemExit('takeover constants not found')
+          s = s.replace(old, new, 1)
+
+          old = '''    self.ti_handoff_active = False
+    self.ti_handoff_hold_frames = 0
+    self.ti_handoff_ramp_frames = 0'''
+          new = '''    self.ti_handoff_active = False
+    self.ti_handoff_hold_frames = 0'''
+          if old not in s:
+            raise SystemExit('takeover state init not found')
+          s = s.replace(old, new, 1)
+
+          old = '''    if not CC.latActive or not ti_takeover_capable:
+      self.ti_handoff_active = False
+      self.ti_handoff_hold_frames = 0
+      self.ti_handoff_ramp_frames = 0
+    elif driver_touch:
+      # Immediate hand-back: the very next CAN command is zero torque.
+      self.ti_handoff_active = True
+      self.ti_handoff_hold_frames = 0
+      self.ti_handoff_ramp_frames = 0
+    elif self.ti_handoff_active:
+      if self.ti_handoff_hold_frames < TI_HANDOFF_RELEASE_DELAY_FRAMES:
+        self.ti_handoff_hold_frames += 1
+      elif self.ti_handoff_ramp_frames < TI_HANDOFF_RAMP_FRAMES:
+        self.ti_handoff_ramp_frames += 1
+      else:
+        self.ti_handoff_active = False
+
+    handoff_scale = 1.0
+    if self.ti_handoff_active:
+      if self.ti_handoff_hold_frames < TI_HANDOFF_RELEASE_DELAY_FRAMES:
+        handoff_scale = 0.0
+      else:
+        handoff_scale = min(1.0, self.ti_handoff_ramp_frames / TI_HANDOFF_RAMP_FRAMES)'''
+          new = '''    if not CC.latActive or not ti_takeover_capable:
+      self.ti_handoff_active = False
+      self.ti_handoff_hold_frames = 0
+    elif driver_touch:
+      # Immediate hand-back: the very next CAN command is zero torque.
+      self.ti_handoff_active = True
+      self.ti_handoff_hold_frames = 0
+    elif self.ti_handoff_active:
+      # Hold both OP and TI at zero for exactly 0.50 s after the driver releases
+      # the wheel, then restore both immediately with no ramp.
+      if self.ti_handoff_hold_frames + 1 >= TI_HANDOFF_RELEASE_DELAY_FRAMES:
+        self.ti_handoff_hold_frames = TI_HANDOFF_RELEASE_DELAY_FRAMES
+        self.ti_handoff_active = False
+      else:
+        self.ti_handoff_hold_frames += 1
+
+    handoff_scale = 0.0 if self.ti_handoff_active else 1.0'''
+          if old not in s:
+            raise SystemExit('takeover state machine not found')
+          s = s.replace(old, new, 1)
+
+          p.write_text(s)
+          PY
+
+          git add opendbc/car/mazda/carcontroller.py
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git commit -m 'Set CX8 TI driver takeover hold to 0.5s without ramp'
+          git push origin HEAD:cx8-ti-handoff-0.5s
+
+      - name: Verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q 'TI_HANDOFF_RELEASE_DELAY_FRAMES = int(0.50 / DT_CTRL)' opendbc/car/mazda/carcontroller.py
+          ! grep -q 'TI_HANDOFF_RAMP_FRAMES' opendbc/car/mazda/carcontroller.py
+          grep -q 'handoff_scale = 0.0 if self.ti_handoff_active else 1.0' opendbc/car/mazda/carcontroller.py
+          grep -q 'create_ti_steering_control(self.packer, ti_apply_torque)' opendbc/car/mazda/carcontroller.py
+          echo 'CX8 TI takeover: zero torque on driver touch, 0.50s zero hold after release, then immediate OP+TI restore; no ramp.'
