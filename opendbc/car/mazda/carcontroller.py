@@ -19,9 +19,9 @@ LongCtrlState = structs.CarControl.Actuators.LongControlState
 LONG_BUSES = (0, 2)
 
 # Driver takeover: yield immediately on steering-wheel input, keep TI alive and
-# transmitting zero torque, then wait 100 ms after release before a 500 ms ramp back.
-TI_HANDOFF_RELEASE_DELAY_FRAMES = int(0.10 / DT_CTRL)
-TI_HANDOFF_RAMP_FRAMES = int(0.50 / DT_CTRL)
+# transmitting zero torque, then hold zero torque for 500 ms after release before
+# immediately restoring the requested OP + TI torque. No ramp is used.
+TI_HANDOFF_RELEASE_DELAY_FRAMES = int(0.50 / DT_CTRL)
 
 
 class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterface):
@@ -51,7 +51,6 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
     self.breakaway_frames = 0
     self.ti_handoff_active = False
     self.ti_handoff_hold_frames = 0
-    self.ti_handoff_ramp_frames = 0
 
   def update(self, CC, CC_SP, CS, now_nanos):
     can_sends = []
@@ -70,26 +69,20 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
     if not CC.latActive or not ti_takeover_capable:
       self.ti_handoff_active = False
       self.ti_handoff_hold_frames = 0
-      self.ti_handoff_ramp_frames = 0
     elif driver_touch:
       # Immediate hand-back: the very next CAN command is zero torque.
       self.ti_handoff_active = True
       self.ti_handoff_hold_frames = 0
-      self.ti_handoff_ramp_frames = 0
     elif self.ti_handoff_active:
-      if self.ti_handoff_hold_frames < TI_HANDOFF_RELEASE_DELAY_FRAMES:
-        self.ti_handoff_hold_frames += 1
-      elif self.ti_handoff_ramp_frames < TI_HANDOFF_RAMP_FRAMES:
-        self.ti_handoff_ramp_frames += 1
-      else:
+      # Hold both OP and TI at zero for 0.50 s after the driver releases
+      # the wheel, then restore both immediately with no ramp.
+      if self.ti_handoff_hold_frames + 1 >= TI_HANDOFF_RELEASE_DELAY_FRAMES:
+        self.ti_handoff_hold_frames = TI_HANDOFF_RELEASE_DELAY_FRAMES
         self.ti_handoff_active = False
-
-    handoff_scale = 1.0
-    if self.ti_handoff_active:
-      if self.ti_handoff_hold_frames < TI_HANDOFF_RELEASE_DELAY_FRAMES:
-        handoff_scale = 0.0
       else:
-        handoff_scale = min(1.0, self.ti_handoff_ramp_frames / TI_HANDOFF_RAMP_FRAMES)
+        self.ti_handoff_hold_frames += 1
+
+    handoff_scale = 0.0 if self.ti_handoff_active else 1.0
 
     # Speed-dependent STEER_MAX (CX-5 2022: 1200 below 32 mph, 800 above). This is the scale
     # from the controller's normalized output to CAN counts, so it stays put -- see values.py.
@@ -266,7 +259,7 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
       if session_state == RadarSessionState.SILENCING:
         can_sends.append(create_radar_session_msg(uds.SESSION_TYPE.PROGRAMMING))
       elif session_state == RadarSessionState.HANDBACK:
-        can_sends.append(create_radar_session_msg(uds.SESSION_TYPE.DEFAULT))
+        can_sends.append(create_radar_session_msg(uds.SESSION_TYPE.DEFAULT)
       elif session_state == RadarSessionState.SILENCED:
         # keeps the radar in its diagnostic session, and with it the stock frames silenced
         can_sends.append(make_tester_present_msg(RADAR_ADDR, 0, suppress_response=True))
@@ -327,7 +320,7 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
         self.release_ramp = None
         # Slew limit the plan-following command. accel_last is tracked through overrides too,
         # so taking control back when the driver lifts off ramps in instead of stepping.
-        accel = rate_limit(accel, self.accel_last, CarControllerParams.ACCEL_WINDDOWN_LIMIT,
+        accel = rate_limit(accel, self.accel_last, CarControllerParams.ACCEL_WINDOWN_LIMIT,
                            CarControllerParams.ACCEL_WINDUP_LIMIT)
       if sm.car_has_hold:
         # the body ECU is holding the brakes itself, so stop asking for them like stock does
