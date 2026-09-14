@@ -18,6 +18,11 @@ LongCtrlState = structs.CarControl.Actuators.LongControlState
 # received frames between those buses, not our own transmissions.
 LONG_BUSES = (0, 2)
 
+# Driver takeover: yield immediately on steering-wheel input, keep TI alive and
+# transmitting zero torque, then wait 100 ms after release before a 500 ms ramp back.
+TI_HANDOFF_RELEASE_DELAY_FRAMES = int(0.10 / DT_CTRL)
+TI_HANDOFF_RAMP_FRAMES = int(0.50 / DT_CTRL)
+
 
 class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterface):
   def __init__(self, dbc_names, CP, CP_SP):
@@ -44,12 +49,44 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
     self.accel_last = 0.
     self.release_ramp = None
     self.breakaway_frames = 0
+    self.ti_handoff_active = False
+    self.ti_handoff_hold_frames = 0
+    self.ti_handoff_ramp_frames = 0
 
   def update(self, CC, CC_SP, CS, now_nanos):
     can_sends = []
 
     apply_torque = 0
     ti_apply_torque = 0
+
+    # Driver takeover state machine. This does NOT disable TI: TI readiness/state is
+    # left untouched and create_ti_steering_control() continues to send every frame.
+    ti_takeover_capable = bool(self.CP.flags & MazdaFlags.TORQUE_INTERCEPTOR) and CS.ti_lkas_allowed
+    driver_touch = bool(CC.latActive and ti_takeover_capable and CS.out.steeringPressed)
+
+    if not CC.latActive or not ti_takeover_capable:
+      self.ti_handoff_active = False
+      self.ti_handoff_hold_frames = 0
+      self.ti_handoff_ramp_frames = 0
+    elif driver_touch:
+      # Immediate hand-back: the very next CAN command is zero torque.
+      self.ti_handoff_active = True
+      self.ti_handoff_hold_frames = 0
+      self.ti_handoff_ramp_frames = 0
+    elif self.ti_handoff_active:
+      if self.ti_handoff_hold_frames < TI_HANDOFF_RELEASE_DELAY_FRAMES:
+        self.ti_handoff_hold_frames += 1
+      elif self.ti_handoff_ramp_frames < TI_HANDOFF_RAMP_FRAMES:
+        self.ti_handoff_ramp_frames += 1
+      else:
+        self.ti_handoff_active = False
+
+    handoff_scale = 1.0
+    if self.ti_handoff_active:
+      if self.ti_handoff_hold_frames < TI_HANDOFF_RELEASE_DELAY_FRAMES:
+        handoff_scale = 0.0
+      else:
+        handoff_scale = min(1.0, self.ti_handoff_ramp_frames / TI_HANDOFF_RAMP_FRAMES)
 
     # Speed-dependent STEER_MAX (CX-5 2022: 1200 below 32 mph, 800 above). This is the scale
     # from the controller's normalized output to CAN counts, so it stays put -- see values.py.
@@ -112,6 +149,19 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
         self.ti_rt_torque_last = ti_apply_torque
         self.ti_rt_torque_last_ts = now_nanos
       self.ti_apply_torque_last = ti_apply_torque
+
+    # Apply the same hand-back envelope to both host OP steering and TI steering.
+    # During the takeover window both are explicitly zero; TI itself remains running.
+    if self.ti_handoff_active:
+      apply_torque = int(round(apply_torque * handoff_scale))
+      ti_apply_torque = int(round(ti_apply_torque * handoff_scale))
+      self.ti_apply_torque_last = ti_apply_torque
+      if handoff_scale == 0.0:
+        apply_torque = 0
+        ti_apply_torque = 0
+        self.ti_apply_torque_last = 0
+        self.ti_rt_torque_last = 0
+        self.ti_rt_torque_last_ts = now_nanos
 
     # Under op-long, controlsd raises cancel whenever cruiseState.enabled has no matching
     # CC.enabled (pcmCruise). While the stock radar still owns the bus -- the pre-teardown
