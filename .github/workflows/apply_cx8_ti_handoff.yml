@@ -26,11 +26,11 @@ jobs:
           p = Path('opendbc/car/mazda/carcontroller.py')
           s = p.read_text()
 
-          old = '''LONG_BUSES = (0, 2)\n'''
+          old = 'LONG_BUSES = (0, 2)\n'
           new = '''LONG_BUSES = (0, 2)\n\n# Driver takeover: yield immediately on steering-wheel input, keep TI alive and\n# transmitting zero torque, then wait 100 ms after release before a 500 ms ramp back.\nTI_HANDOFF_RELEASE_DELAY_FRAMES = int(0.10 / DT_CTRL)\nTI_HANDOFF_RAMP_FRAMES = int(0.50 / DT_CTRL)\n'''
-          if old not in s or 'TI_HANDOFF_RELEASE_DELAY_FRAMES' not in s:
+          if old not in s:
             raise SystemExit('missing LONG_BUSES anchor')
-          if 'TI_HANDOFF_RAMP_FRAMES' not in s:
+          if 'TI_HANDOFF_RELEASE_DELAY_FRAMES' not in s:
             s = s.replace(old, new, 1)
 
           old = '''    self.release_ramp = None\n    self.breakaway_frames = 0\n'''
@@ -48,7 +48,7 @@ jobs:
             s = s.replace(old, new, 1)
 
           old = '''      self.ti_apply_torque_last = ti_apply_torque\n\n    # Under op-long,'''
-          new = '''      self.ti_apply_torque_last = ti_apply_torque\n\n    # Apply the same hand-back envelope to both host OP steering and TI steering.\n    # During the takeover window both are explicitly zero; TI itself remains running.\n    if self.ti_handoff_active:\n      apply_torque = int(round(apply_torque * handoff_scale))\n      ti_apply_torque = int(round(ti_apply_torque * handoff_scale))\n      if handoff_scale == 0.0:\n        apply_torque = 0\n        ti_apply_torque = 0\n        self.ti_rt_torque_last = 0\n        self.ti_rt_torque_last_ts = now_nanos\n\n    # Under op-long,'''
+          new = '''      self.ti_apply_torque_last = ti_apply_torque\n\n    # Apply the same hand-back envelope to both host OP steering and TI steering.\n    # During the takeover window both are explicitly zero; TI itself remains running.\n    if self.ti_handoff_active:\n      apply_torque = int(round(apply_torque * handoff_scale))\n      ti_apply_torque = int(round(ti_apply_torque * handoff_scale))\n      self.ti_apply_torque_last = ti_apply_torque\n      if handoff_scale == 0.0:\n        apply_torque = 0\n        ti_apply_torque = 0\n        self.ti_apply_torque_last = 0\n        self.ti_rt_torque_last = 0\n        self.ti_rt_torque_last_ts = now_nanos\n\n    # Under op-long,'''
           if old not in s:
             raise SystemExit('missing TI handoff insertion anchor')
           if 'Apply the same hand-back envelope' not in s:
@@ -56,6 +56,8 @@ jobs:
 
           p.write_text(s)
           PY
+
+          python3 -m py_compile opendbc/car/mazda/carcontroller.py
 
       - name: Remove temporary workflow
         run: rm -f .github/workflows/apply_cx8_ti_handoff.yml
